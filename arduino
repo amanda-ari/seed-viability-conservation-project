@@ -1,0 +1,1888 @@
+#include <DHT.h>
+#include <Servo.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <OneButton.h>
+#include <HX711.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ==================================================
+// DUAL SILICA-GEL CONTROLLER - TIME BASED HEATING
+//
+// New heating rule:
+//   heating time = actual servo-open time
+//                  x HEATING_TIME_MULTIPLIER
+//
+// Temperature is NOT used to calculate heating time.
+// It is used only for telemetry and over-temperature safety.
+// ==================================================
+
+// ---------------- Shared DHT22 ----------------
+const int DHT_PIN = 8;
+#define DHT_TYPE DHT22
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ---------------- Peltier temperature controller ----------------
+const int PELTIER_PIN = A4;
+const float PELTIER_TEMP_THRESHOLD = 30.0;  // Change as required
+const float PELTIER_TEMP_HYSTERESIS = 1.0; // Prevent rapid relay switching
+const unsigned long PELTIER_TEMP_CHECK_INTERVAL = 2500UL;
+
+// true = automatic temperature control is enabled.
+// false = Peltier is forced OFF so the lock may be used.
+bool peltierControlEnabled = true;
+bool peltierOutputOn = false;
+float latestMainTemperature = 0.0;
+unsigned long lastPeltierTemperatureCheckMs = 0;
+
+// ---------------- Default / left system ----------------
+const int DEFAULT_MOTOR_IN3 = 36;
+const int DEFAULT_MOTOR_IN4 = 38;
+const int DEFAULT_LIMIT_OUT = 41;
+const int DEFAULT_LIMIT_IN  = 42;
+const int DEFAULT_PTC_PIN = A2;
+const int DEFAULT_FAN_PIN = 12;
+const int DEFAULT_TEMP_PIN = 17;
+const int DEFAULT_SERVO_PIN = 16;
+
+// ---------------- Standby / right system ----------------
+const int STANDBY_MOTOR_IN3 = 40;
+const int STANDBY_MOTOR_IN4 = 48;
+const int STANDBY_LIMIT_OUT = 26;
+const int STANDBY_LIMIT_IN  = 30;
+const int STANDBY_PTC_PIN = A1;
+const int STANDBY_FAN_PIN = 11;
+const int STANDBY_TEMP_PIN = 43;
+const int STANDBY_SERVO_PIN = 6;
+
+// ---------------- Servo angles ----------------
+const int DEFAULT_DOOR_CLOSED = 180;
+const int DEFAULT_DOOR_OPEN   = 90;
+const int STANDBY_DOOR_CLOSED = 0;
+const int STANDBY_DOOR_OPEN   = 90;
+
+// ---------------- Control settings ----------------
+const float HUM_THRESHOLD = 82.0;
+
+// One second of door-open time produces this many seconds of heating.
+// 1.0 = 1 second open -> 1 second heating.
+// 2.0 = 1 second open -> 2 seconds heating.
+const float HEATING_TIME_MULTIPLIER = 1.0;
+
+// Temperature is used only as a safety limit.
+const float PTC_TEMP_THRESHOLD = 80.0;
+
+// ---------------- Time settings ----------------
+const unsigned long HUMIDITY_CHECK_TIME = 3000UL;
+const unsigned long PTC_COOLING_TIME = 10000UL;
+const unsigned long LIMIT_SETTLE_TIME = 300UL;
+const unsigned long AFTER_DOOR_CLOSE_TIME = 500UL;
+const unsigned long TELEMETRY_INTERVAL = 1000UL;
+const unsigned long SERVO_STEP_DELAY_DEFAULT = 20UL;
+const unsigned long SERVO_STEP_DELAY_STANDBY = 15UL;
+const unsigned long MOTOR_TRAVEL_TIMEOUT = 60000UL;
+
+// Safety limits.
+const unsigned long MAX_DOOR_OPEN_TIME = 1800000UL;       // 30 minutes
+const unsigned long MAX_HEATING_PROCESS_TIME = 1800000UL; // 30 minutes active heating
+
+// Mega Serial1 -> NodeMCU
+const unsigned long NODEMCU_BAUD = 9600;
+
+// New heating system hardware pins
+const byte NEW_HEATING_BUTTON_PIN = 35;
+const byte TOP_PTC_PIN = A3;
+const byte BOTTOM_PTC_PIN = 7;
+const byte NEW_FAN_PIN = 47;
+const byte TOP_TEMP_PIN = A10;
+const byte BOTTOM_TEMP_PIN = A11;
+const byte AIR_CLEAN_FAN_PIN = 14;
+
+// Weight sensor pins
+const byte HX711_DT_PIN = 32;
+const byte HX711_SCK_PIN = 34;
+
+// ---------------- Objects ----------------
+OneWire defaultOneWire(DEFAULT_TEMP_PIN);
+DallasTemperature defaultTempSensor(&defaultOneWire);
+OneWire standbyOneWire(STANDBY_TEMP_PIN);
+DallasTemperature standbyTempSensor(&standbyOneWire);
+Servo defaultServo;
+Servo standbyServo;
+
+// New heating system objects
+OneWire topOneWire(TOP_TEMP_PIN);
+DallasTemperature topTempSensor(&topOneWire);
+OneWire bottomOneWire(BOTTOM_TEMP_PIN);
+DallasTemperature bottomTempSensor(&bottomOneWire);
+HX711 scale;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// New heating system states and variables
+const byte PTC_ACTIVE = LOW;
+const byte PTC_INACTIVE = HIGH;
+const byte FAN_ACTIVE = LOW;
+const byte FAN_INACTIVE = HIGH;
+
+// Air cleaning fan states and timing
+const byte AIR_CLEAN_FAN_ACTIVE = LOW;
+const byte AIR_CLEAN_FAN_INACTIVE = HIGH;
+const unsigned long AIR_CLEAN_TIME = 30000UL; // Configurable duration in ms (30 seconds)
+
+unsigned long airCleanStartMs = 0;
+bool airCleanActive = false;
+
+enum NewHeatingState {
+  NEW_HEATING_OFF,
+  NEW_HEATING_TOP,
+  NEW_HEATING_BOTTOM
+};
+NewHeatingState newHeatingState = NEW_HEATING_OFF;
+
+float latestTopTemp = 0.0;
+float latestBottomTemp = 0.0;
+unsigned long lastTempRequestMs = 0;
+bool tempRequestPending = false;
+
+// Weight calibration factors
+const float SCALE_CALIBRATION_FACTOR = 96.9064f;
+const long SCALE_OFFSET = -397998;
+const float HEATING_WEIGHT_PERCENTAGE = 0.30; // Stop when weight reaches 30% of starting weight
+
+float latestWeight = 0.0;
+float startWeight = 0.0;
+float targetWeight = 0.0;
+unsigned long lastWeightReadMs = 0;
+
+// ---------------- State ----------------
+bool defaultHeatingActive = false;
+bool standbyHeatingActive = false;
+bool defaultDoorOpen = false;
+bool standbyDoorOpen = false;
+
+float latestHumidity = 0.0;
+float defaultTemperatureTelemetry = 0.0;
+float standbyTemperatureTelemetry = 0.0;
+
+float defaultServoOpenTimeSec = 0.0;
+float standbyServoOpenTimeSec = 0.0;
+
+unsigned long defaultHeatingStartedMs = 0;
+unsigned long standbyHeatingStartedMs = 0;
+unsigned long defaultHeatingElapsedSec = 0;
+unsigned long standbyHeatingElapsedSec = 0;
+long defaultHeatingRemainingSec = -1;
+long standbyHeatingRemainingSec = -1;
+
+unsigned long defaultRequiredHeatingSec = 0;
+unsigned long standbyRequiredHeatingSec = 0;
+unsigned long lastTelemetrySentMs = 0;
+
+// Standby exposure tracking while default is heating.
+unsigned long standbyDoorOpenedAtMs = 0;
+unsigned long standbyExposureDurationMs = 0;
+bool standbyExposureUsed = false;
+
+// =====================================================
+// PIN DEFINITIONS
+// =====================================================
+
+// Lock / Peltier control button
+const byte LOCK_BUTTON_PIN = 45;
+
+// OneButton uses INPUT_PULLUP and an active-LOW button.
+OneButton lockPeltierButton(LOCK_BUTTON_PIN, true, true);
+
+// Buzzer
+const byte BUZZER_PIN = 5;
+
+// Alarm LEDs
+const byte ALARM_LED1_PIN = A5;
+const byte ALARM_LED2_PIN = 39;
+
+// Electronic lock
+const byte LOCK_PIN = A0;
+
+// Tray motor
+const byte MOTOR_IN1_PIN = 22;
+const byte MOTOR_IN2_PIN = 23;
+
+// Limit switches
+const byte LIMIT_OUT_PIN = 31;
+const byte LIMIT_IN_PIN  = 29;
+
+// Manual tray buttons
+const byte OUT_BUTTON_PIN = 33;
+
+// RFID pins
+const byte RFID_SS_PIN  = 53;
+const byte RFID_RST_PIN = 49;
+
+// Arduino Mega hardware SPI pins:
+// SCK  = 52
+// MOSI = 51
+// MISO = 50
+// SDA/SS = 53
+
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+
+// =====================================================
+// RFID AUTHORIZED UID
+// =====================================================
+
+const byte AUTHORIZED_UID[] = {0xBC, 0x32, 0xAB, 0x04};
+const byte AUTHORIZED_UID_LENGTH = 4;
+
+// =====================================================
+// SETTINGS
+// =====================================================
+
+// Change these if your relay or lock works in reverse.
+const byte LOCK_ACTIVE_STATE   = HIGH;  // Locked
+const byte LOCK_INACTIVE_STATE = LOW;   // Unlocked
+
+// Buttons and limit switches are connected to GND when pressed.
+const byte PRESSED = LOW;
+
+// Hold lock button for 2 seconds to unlock.
+const unsigned long UNLOCK_HOLD_TIME = 2000;
+
+// Buzzer alarm duration.
+const unsigned long ALARM_DURATION = 1000;
+
+// RFID unlock duration.
+// After this time, the lock automatically locks again.
+const unsigned long RFID_UNLOCK_DURATION = 5000;
+
+// =====================================================
+// SYSTEM STATES
+// =====================================================
+
+enum TrayDirection {
+  TRAY_STOPPED,
+  TRAY_MOVING_OUT,
+  TRAY_MOVING_IN
+};
+
+TrayDirection trayDirection = TRAY_STOPPED;
+
+bool doorLocked = false;
+
+unsigned long buzzerStartTime = 0;
+bool buzzerActive = false;
+
+unsigned long rfidUnlockStartTime = 0;
+bool temporaryRFIDUnlock = false;
+
+// Background-control readiness flag.
+bool auxiliaryControlsReady = false;
+
+// ==================================================
+// SETUP
+// ==================================================
+void setup() {
+  Serial.begin(9600);
+  Serial1.begin(NODEMCU_BAUD);
+
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+
+  // ---------------- Lock / RFID / manual tray setup ----------------
+  pinMode(LOCK_PIN, OUTPUT);
+  pinMode(PELTIER_PIN, OUTPUT);
+
+  // Peltier relay is active LOW. Start safely OFF, then enable
+  // automatic control after all system states are initialized.
+  digitalWrite(PELTIER_PIN, HIGH);
+  peltierOutputOn = false;
+
+  lockPeltierButton.attachClick(handlePeltierQuickPress);
+  lockPeltierButton.attachLongPressStart(handleLockLongPress);
+  lockPeltierButton.setPressMs(2000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(ALARM_LED1_PIN, OUTPUT);
+  pinMode(ALARM_LED2_PIN, OUTPUT);
+  digitalWrite(ALARM_LED1_PIN, LOW);
+  digitalWrite(ALARM_LED2_PIN, LOW);
+
+  pinMode(MOTOR_IN1_PIN, OUTPUT);
+  pinMode(MOTOR_IN2_PIN, OUTPUT);
+  stopTray();
+
+  pinMode(LIMIT_OUT_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_IN_PIN, INPUT_PULLUP);
+  pinMode(OUT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(NEW_HEATING_BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(TOP_PTC_PIN, OUTPUT);
+  pinMode(BOTTOM_PTC_PIN, OUTPUT);
+  pinMode(NEW_FAN_PIN, OUTPUT);
+  pinMode(AIR_CLEAN_FAN_PIN, OUTPUT);
+  digitalWrite(TOP_PTC_PIN, PTC_INACTIVE);
+  digitalWrite(BOTTOM_PTC_PIN, PTC_INACTIVE);
+  digitalWrite(NEW_FAN_PIN, FAN_INACTIVE);
+  digitalWrite(AIR_CLEAN_FAN_PIN, AIR_CLEAN_FAN_INACTIVE);
+
+  topTempSensor.begin();
+  bottomTempSensor.begin();
+  topTempSensor.setWaitForConversion(false);
+  bottomTempSensor.setWaitForConversion(false);
+
+  // Initialize HX711 scale
+  scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
+  scale.set_scale(SCALE_CALIBRATION_FACTOR);
+  scale.set_offset(SCALE_OFFSET);
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  // Start electronic lock unlocked and allow automatic Peltier control.
+  unlockDoor();
+  peltierControlEnabled = false;
+  auxiliaryControlsReady = true;
+
+  pinMode(DEFAULT_MOTOR_IN3, OUTPUT);
+  pinMode(DEFAULT_MOTOR_IN4, OUTPUT);
+  pinMode(STANDBY_MOTOR_IN3, OUTPUT);
+  pinMode(STANDBY_MOTOR_IN4, OUTPUT);
+
+  pinMode(DEFAULT_LIMIT_OUT, INPUT_PULLUP);
+  pinMode(DEFAULT_LIMIT_IN, INPUT_PULLUP);
+  pinMode(STANDBY_LIMIT_OUT, INPUT_PULLUP);
+  pinMode(STANDBY_LIMIT_IN, INPUT_PULLUP);
+
+  pinMode(DEFAULT_PTC_PIN, OUTPUT);
+  pinMode(DEFAULT_FAN_PIN, OUTPUT);
+  pinMode(STANDBY_PTC_PIN, OUTPUT);
+  pinMode(STANDBY_FAN_PIN, OUTPUT);
+
+  dht.begin();
+  defaultTempSensor.begin();
+  standbyTempSensor.begin();
+
+  defaultServo.attach(DEFAULT_SERVO_PIN);
+  standbyServo.attach(STANDBY_SERVO_PIN);
+
+  defaultServo.write(DEFAULT_DOOR_CLOSED);
+  standbyServo.write(STANDBY_DOOR_CLOSED);
+
+  stopDefaultMotor();
+  stopStandbyMotor();
+  stopDefaultHeating();
+  stopStandbyHeating();
+
+  Serial.println("======================================");
+  Serial.println("Dual Silica-Gel Controller Started");
+  Serial.println("Heating calculation: servo-open time based");
+  Serial.print("Peltier temperature threshold: ");
+  Serial.print(PELTIER_TEMP_THRESHOLD, 1);
+  Serial.println(" C");
+  Serial.println("Quick press: disable/enable automatic Peltier control");
+  Serial.println("Long press: lock/unlock only while Peltier is OFF");
+  Serial.print("Heating multiplier: ");
+  Serial.println(HEATING_TIME_MULTIPLIER, 2);
+  Serial.println("Authorized RFID: BC 32 AB 04");
+  Serial.println("Manual tray and lock controls enabled");
+  Serial.println("======================================");
+
+  responsiveDelay(1000);
+  homeBothTrays();
+  sendTelemetry(true);
+}
+
+// ==================================================
+// MAIN LOOP
+// ==================================================
+void loop() {
+  serviceAuxiliaryControls();
+  enforceHeatingInterlock();
+
+  if (digitalRead(DEFAULT_LIMIT_IN) != LOW ||
+      digitalRead(STANDBY_LIMIT_IN) != LOW) {
+    homeBothTrays();
+    return;
+  }
+
+  stopDefaultMotor();
+  stopStandbyMotor();
+
+  float humidity = readHumidity();
+
+  if (isnan(humidity)) {
+    Serial.println("ERROR: DHT22 humidity read failed");
+    ensureBothDoorsClosed();
+    telemetryDelay(HUMIDITY_CHECK_TIME);
+    return;
+  }
+
+  latestHumidity = humidity;
+  sendTelemetry(false);
+
+  Serial.println("--------------------------------------");
+  Serial.print("Current humidity: ");
+  Serial.print(humidity, 2);
+  Serial.println(" %");
+
+  if (humidity > HUM_THRESHOLD) {
+    runCompleteDualCycle();
+  } else {
+    ensureBothDoorsClosed();
+    Serial.println("Humidity is at or below threshold");
+    telemetryDelay(HUMIDITY_CHECK_TIME);
+  }
+}
+
+// ==================================================
+// COMPLETE DUAL CYCLE
+// ==================================================
+void runCompleteDualCycle() {
+  Serial.println("Starting DEFAULT humidity reduction");
+
+  // Keep default door open until humidity reaches threshold.
+  unsigned long defaultOpenMs =
+      runDefaultHumidityReduction();
+
+  if (defaultOpenMs == 0) {
+    Serial.println("DEFAULT humidity reduction aborted");
+    return;
+  }
+
+  defaultServoOpenTimeSec = defaultOpenMs / 1000.0;
+  defaultRequiredHeatingSec =
+      calculateHeatingSeconds(defaultOpenMs);
+
+  printHeatingCalculation(
+      "DEFAULT",
+      defaultServoOpenTimeSec,
+      defaultRequiredHeatingSec
+  );
+
+  closeDefaultDoorSmoothly();
+  defaultDoorOpen = false;
+  responsiveDelay(AFTER_DOOR_CLOSE_TIME);
+
+  Serial.println("Moving DEFAULT tray OUT");
+  moveDefaultOut();
+
+  if (!waitForLimit(DEFAULT_LIMIT_OUT,
+                    MOTOR_TRAVEL_TIMEOUT,
+                    "DEFAULT OUT")) {
+    stopDefaultMotor();
+    stopDefaultHeating();
+    homeBothTrays();
+    return;
+  }
+
+  stopDefaultMotor();
+  responsiveDelay(LIMIT_SETTLE_TIME);
+
+  // Standby may control humidity only while default is heating.
+  prepareStandbyHumidityControl();
+
+  bool defaultHeatingCompleted =
+      runDefaultTimedHeating(defaultRequiredHeatingSec * 1000UL);
+
+  Serial.println("Moving DEFAULT tray IN");
+  moveDefaultIn();
+
+  bool defaultReturnedIn =
+      waitForLimit(DEFAULT_LIMIT_IN,
+                   MOTOR_TRAVEL_TIMEOUT,
+                   "DEFAULT IN");
+
+  stopDefaultMotor();
+
+  if (!defaultReturnedIn) {
+    stopDefaultHeating();
+    stopStandbyHeating();
+    returnStandbyToHumidityControl();
+    return;
+  }
+
+  responsiveDelay(LIMIT_SETTLE_TIME);
+
+  // If standby is still open, continue until humidity reaches target.
+  if (standbyExposureUsed && standbyDoorOpen) {
+    finishStandbyHumidityReduction();
+  }
+
+  if (standbyExposureUsed) {
+    if (standbyExposureDurationMs == 0) {
+      standbyExposureDurationMs = millis() - standbyDoorOpenedAtMs;
+    }
+
+    standbyServoOpenTimeSec =
+        standbyExposureDurationMs / 1000.0;
+
+    standbyRequiredHeatingSec =
+        calculateHeatingSeconds(standbyExposureDurationMs);
+
+    printHeatingCalculation(
+        "STANDBY",
+        standbyServoOpenTimeSec,
+        standbyRequiredHeatingSec
+    );
+
+    if (standbyDoorOpen) {
+      closeStandbyDoorSmoothly();
+      standbyDoorOpen = false;
+    }
+
+    responsiveDelay(AFTER_DOOR_CLOSE_TIME);
+
+    if (defaultHeatingCompleted &&
+        digitalRead(DEFAULT_LIMIT_IN) == LOW &&
+        !defaultHeatingActive &&
+        digitalRead(DEFAULT_PTC_PIN) == HIGH) {
+
+      Serial.println("Moving STANDBY tray OUT");
+      moveStandbyOut();
+
+      if (!waitForLimit(STANDBY_LIMIT_OUT,
+                        MOTOR_TRAVEL_TIMEOUT,
+                        "STANDBY OUT")) {
+        stopStandbyMotor();
+        stopStandbyHeating();
+        returnStandbyToHumidityControl();
+        return;
+      }
+
+      stopStandbyMotor();
+      responsiveDelay(LIMIT_SETTLE_TIME);
+
+      bool standbyHeatingCompleted =
+          runStandbyTimedHeating(
+              standbyRequiredHeatingSec * 1000UL
+          );
+
+      Serial.println("Moving STANDBY tray IN");
+      moveStandbyIn();
+
+      waitForLimit(STANDBY_LIMIT_IN,
+                   MOTOR_TRAVEL_TIMEOUT,
+                   "STANDBY IN");
+
+      stopStandbyMotor();
+      responsiveDelay(LIMIT_SETTLE_TIME);
+
+      Serial.println(
+          standbyHeatingCompleted
+          ? "STANDBY heating completed"
+          : "STANDBY heating interrupted"
+      );
+    }
+  }
+
+  stopDefaultHeating();
+  stopStandbyHeating();
+  standbyExposureUsed = false;
+
+  Serial.println("Dual cycle completed");
+  sendTelemetry(true);
+}
+
+// ==================================================
+// DEFAULT HUMIDITY REDUCTION
+// Door remains open until humidity <= threshold.
+// ==================================================
+unsigned long runDefaultHumidityReduction() {
+  openDefaultDoorSmoothly();
+  defaultDoorOpen = true;
+
+  unsigned long openedAt = millis();
+
+  while (true) {
+    serviceAuxiliaryControls();
+    unsigned long openDuration = millis() - openedAt;
+
+    if (openDuration >= MAX_DOOR_OPEN_TIME) {
+      Serial.println("WARNING: DEFAULT maximum door-open time reached");
+      return openDuration;
+    }
+
+    float humidity = readHumidity();
+
+    if (isnan(humidity)) {
+      Serial.println("ERROR: DHT22 failed while DEFAULT door was open");
+      closeDefaultDoorSmoothly();
+      defaultDoorOpen = false;
+      return 0;
+    }
+
+    latestHumidity = humidity;
+
+    Serial.print("DEFAULT door open - humidity: ");
+    Serial.print(humidity, 2);
+    Serial.println(" %");
+
+    sendTelemetry(false);
+
+    if (humidity <= HUM_THRESHOLD) {
+      Serial.println("Humidity reached threshold");
+      return millis() - openedAt;
+    }
+  }
+}
+
+// ==================================================
+// STANDBY HUMIDITY CONTROL
+// ==================================================
+void prepareStandbyHumidityControl() {
+  float humidity = readHumidity();
+
+  if (!isnan(humidity)) {
+    latestHumidity = humidity;
+  }
+
+  if (!isnan(humidity) && humidity > HUM_THRESHOLD) {
+    Serial.println("Opening STANDBY door during DEFAULT heating");
+    openStandbyDoorSmoothly();
+    standbyDoorOpen = true;
+    standbyExposureUsed = true;
+    standbyDoorOpenedAtMs = millis();
+    standbyExposureDurationMs = 0;
+  } else {
+    closeStandbyDoorSmoothly();
+    standbyDoorOpen = false;
+    standbyExposureUsed = false;
+  }
+}
+
+void monitorStandbyHumidityDuringDefaultHeating() {
+  if (!standbyExposureUsed || !standbyDoorOpen) {
+    return;
+  }
+
+  if (millis() - standbyDoorOpenedAtMs >= MAX_DOOR_OPEN_TIME) {
+    Serial.println("WARNING: STANDBY maximum door-open time reached");
+    standbyExposureDurationMs = millis() - standbyDoorOpenedAtMs;
+    closeStandbyDoorSmoothly();
+    standbyDoorOpen = false;
+    return;
+  }
+
+  float humidity = readHumidity();
+
+  if (isnan(humidity)) {
+    Serial.println("ERROR: DHT22 failed while STANDBY door was open");
+    closeStandbyDoorSmoothly();
+    standbyDoorOpen = false;
+    return;
+  }
+
+  latestHumidity = humidity;
+
+  Serial.print("STANDBY door open - humidity: ");
+  Serial.print(humidity, 2);
+  Serial.println(" %");
+
+  if (humidity <= HUM_THRESHOLD) {
+    Serial.println("Humidity reached threshold; closing STANDBY door");
+    standbyExposureDurationMs = millis() - standbyDoorOpenedAtMs;
+    closeStandbyDoorSmoothly();
+    standbyDoorOpen = false;
+  }
+}
+
+void finishStandbyHumidityReduction() {
+  while (standbyDoorOpen) {
+    serviceAuxiliaryControls();
+    if (millis() - standbyDoorOpenedAtMs >= MAX_DOOR_OPEN_TIME) {
+      Serial.println("WARNING: STANDBY maximum door-open time reached");
+      break;
+    }
+
+    float humidity = readHumidity();
+
+    if (isnan(humidity)) {
+      Serial.println("ERROR: DHT22 failed during STANDBY control");
+      break;
+    }
+
+    latestHumidity = humidity;
+    sendTelemetry(false);
+
+    Serial.print("Waiting for humidity threshold: ");
+    Serial.print(humidity, 2);
+    Serial.println(" %");
+
+    if (humidity <= HUM_THRESHOLD) {
+      break;
+    }
+  }
+
+  standbyExposureDurationMs = millis() - standbyDoorOpenedAtMs;
+  closeStandbyDoorSmoothly();
+  standbyDoorOpen = false;
+}
+
+// ==================================================
+// TIME CALCULATION
+// ==================================================
+unsigned long calculateHeatingSeconds(unsigned long servoOpenMs) {
+  float servoOpenSeconds = servoOpenMs / 1000.0;
+  float calculatedSeconds =
+      servoOpenSeconds * HEATING_TIME_MULTIPLIER;
+
+  if (calculatedSeconds < 1.0) {
+    calculatedSeconds = 1.0;
+  }
+
+  unsigned long maxSeconds =
+      MAX_HEATING_PROCESS_TIME / 1000UL;
+
+  if (calculatedSeconds > maxSeconds) {
+    calculatedSeconds = maxSeconds;
+  }
+
+  return (unsigned long)(calculatedSeconds + 0.5);
+}
+
+void printHeatingCalculation(
+    const char* systemName,
+    float servoOpenSeconds,
+    unsigned long heatingSeconds) {
+
+  Serial.println("--------------------------------------");
+  Serial.print(systemName);
+  Serial.println(" HEATING CALCULATION");
+
+  Serial.print("Servo open time: ");
+  Serial.print(servoOpenSeconds, 2);
+  Serial.println(" seconds");
+
+  Serial.print("Heating multiplier: ");
+  Serial.println(HEATING_TIME_MULTIPLIER, 2);
+
+  Serial.print("Calculated heating time: ");
+  Serial.print(heatingSeconds);
+  Serial.println(" seconds");
+}
+
+// ==================================================
+// DEFAULT TIMED HEATING
+// Cooling time is not counted as active heating time.
+// ==================================================
+bool runDefaultTimedHeating(unsigned long requiredHeatingMs) {
+  if (requiredHeatingMs == 0) {
+    return true;
+  }
+
+  requiredHeatingMs =
+      min(requiredHeatingMs, MAX_HEATING_PROCESS_TIME);
+
+  defaultHeatingStartedMs = millis();
+  defaultHeatingElapsedSec = 0;
+  defaultHeatingRemainingSec = requiredHeatingMs / 1000UL;
+
+  unsigned long accumulatedHeatingMs = 0;
+  unsigned long heaterOnStartedAt = millis();
+  unsigned long lastStandbyHumidityCheck = 0;
+
+  startDefaultHeating();
+  sendTelemetry(true);
+
+  Serial.println("DEFAULT timed heating started");
+
+  while (accumulatedHeatingMs < requiredHeatingMs) {
+    serviceAuxiliaryControls();
+    enforceHeatingInterlock();
+
+    if (!defaultHeatingActive) {
+      Serial.println("DEFAULT heating stopped unexpectedly");
+      return false;
+    }
+
+    unsigned long now = millis();
+    accumulatedHeatingMs += now - heaterOnStartedAt;
+    heaterOnStartedAt = now;
+
+    defaultHeatingElapsedSec = accumulatedHeatingMs / 1000UL;
+    unsigned long defaultRemainingMs =
+        accumulatedHeatingMs >= requiredHeatingMs
+        ? 0
+        : requiredHeatingMs - accumulatedHeatingMs;
+
+    defaultHeatingRemainingSec =
+        (long)((defaultRemainingMs + 999UL) / 1000UL);
+
+    float temperature = readDefaultTemperature();
+    defaultTemperatureTelemetry = temperature;
+
+    if (!validTemperature(temperature)) {
+      stopDefaultHeating();
+      Serial.println("ERROR: DEFAULT temperature sensor failed");
+      sendTelemetry(true);
+      return false;
+    }
+
+    if (temperature > PTC_TEMP_THRESHOLD) {
+      stopDefaultHeating();
+      Serial.println("DEFAULT over-temperature; cooling");
+      sendTelemetry(true);
+      telemetryDelay(PTC_COOLING_TIME);
+      startDefaultHeating();
+      heaterOnStartedAt = millis();
+    }
+
+    if (standbyDoorOpen &&
+        millis() - lastStandbyHumidityCheck >= HUMIDITY_CHECK_TIME) {
+      lastStandbyHumidityCheck = millis();
+      monitorStandbyHumidityDuringDefaultHeating();
+    }
+
+    sendTelemetry(false);
+    responsiveDelay(50);
+  }
+
+  defaultHeatingElapsedSec = requiredHeatingMs / 1000UL;
+  defaultHeatingRemainingSec = 0;
+  stopDefaultHeating();
+  sendTelemetry(true);
+
+  Serial.println("DEFAULT timed heating completed");
+  return true;
+}
+
+// ==================================================
+// STANDBY TIMED HEATING
+// ==================================================
+bool runStandbyTimedHeating(unsigned long requiredHeatingMs) {
+  if (requiredHeatingMs == 0) {
+    return true;
+  }
+
+  if (defaultHeatingActive ||
+      digitalRead(DEFAULT_PTC_PIN) == LOW ||
+      digitalRead(DEFAULT_LIMIT_IN) != LOW) {
+    Serial.println("STANDBY heating blocked by interlock");
+    stopStandbyHeating();
+    return false;
+  }
+
+  requiredHeatingMs =
+      min(requiredHeatingMs, MAX_HEATING_PROCESS_TIME);
+
+  standbyHeatingStartedMs = millis();
+  standbyHeatingElapsedSec = 0;
+  standbyHeatingRemainingSec = requiredHeatingMs / 1000UL;
+
+  unsigned long accumulatedHeatingMs = 0;
+  unsigned long heaterOnStartedAt = millis();
+
+  startStandbyHeating();
+  sendTelemetry(true);
+
+  Serial.println("STANDBY timed heating started");
+
+  while (accumulatedHeatingMs < requiredHeatingMs) {
+    serviceAuxiliaryControls();
+    if (defaultHeatingActive ||
+        digitalRead(DEFAULT_PTC_PIN) == LOW) {
+      Serial.println("EMERGENCY: stopping STANDBY heating");
+      stopStandbyHeating();
+      sendTelemetry(true);
+      return false;
+    }
+
+    enforceHeatingInterlock();
+
+    if (!standbyHeatingActive) {
+      return false;
+    }
+
+    unsigned long now = millis();
+    accumulatedHeatingMs += now - heaterOnStartedAt;
+    heaterOnStartedAt = now;
+
+    standbyHeatingElapsedSec = accumulatedHeatingMs / 1000UL;
+    unsigned long standbyRemainingMs =
+        accumulatedHeatingMs >= requiredHeatingMs
+        ? 0
+        : requiredHeatingMs - accumulatedHeatingMs;
+
+    standbyHeatingRemainingSec =
+        (long)((standbyRemainingMs + 999UL) / 1000UL);
+
+    float temperature = readStandbyTemperature();
+    standbyTemperatureTelemetry = temperature;
+
+    if (!validTemperature(temperature)) {
+      stopStandbyHeating();
+      Serial.println("ERROR: STANDBY temperature sensor failed");
+      sendTelemetry(true);
+      return false;
+    }
+
+    if (temperature > PTC_TEMP_THRESHOLD) {
+      stopStandbyHeating();
+      Serial.println("STANDBY over-temperature; cooling");
+      sendTelemetry(true);
+      telemetryDelay(PTC_COOLING_TIME);
+
+      if (defaultHeatingActive ||
+          digitalRead(DEFAULT_PTC_PIN) == LOW) {
+        return false;
+      }
+
+      startStandbyHeating();
+      heaterOnStartedAt = millis();
+    }
+
+    sendTelemetry(false);
+    responsiveDelay(50);
+  }
+
+  standbyHeatingElapsedSec = requiredHeatingMs / 1000UL;
+  standbyHeatingRemainingSec = 0;
+  stopStandbyHeating();
+  sendTelemetry(true);
+
+  Serial.println("STANDBY timed heating completed");
+  return true;
+}
+
+// ==================================================
+// TELEMETRY TO NODEMCU
+// Compatibility fields current_score and required_score
+// now represent elapsed and required HEATING SECONDS.
+// ==================================================
+void sendTelemetry(bool forceSend) {
+  unsigned long now = millis();
+
+  if (!forceSend &&
+      now - lastTelemetrySentMs < TELEMETRY_INTERVAL) {
+    return;
+  }
+
+  lastTelemetrySentMs = now;
+
+  Serial1.print("{\"humidity\":");
+  Serial1.print(latestHumidity, 2);
+  Serial1.print(",\"main_temperature_c\":");
+  Serial1.print(latestMainTemperature, 2);
+  Serial1.print(",\"peltier_enabled\":");
+  Serial1.print(peltierControlEnabled ? "true" : "false");
+  Serial1.print(",\"peltier_on\":");
+  Serial1.print(peltierOutputOn ? "true" : "false");
+  Serial1.print(",\"door_locked\":");
+  Serial1.print(doorLocked ? "true" : "false");
+
+  Serial1.print(",\"default\":{");
+  Serial1.print("\"heating\":");
+  Serial1.print(defaultHeatingActive ? "true" : "false");
+  Serial1.print(",\"started_ms\":");
+  Serial1.print(defaultHeatingStartedMs);
+  Serial1.print(",\"elapsed_s\":");
+  Serial1.print(defaultHeatingElapsedSec);
+  Serial1.print(",\"remaining_s\":");
+  Serial1.print(defaultHeatingRemainingSec);
+  Serial1.print(",\"temperature_c\":");
+  Serial1.print(defaultTemperatureTelemetry, 2);
+  Serial1.print(",\"servo_open_time_s\":");
+  Serial1.print(defaultServoOpenTimeSec, 2);
+  Serial1.print(",\"heating_target_s\":");
+  Serial1.print(defaultRequiredHeatingSec);
+  Serial1.print(",\"current_score\":");
+  Serial1.print(defaultHeatingElapsedSec);
+  Serial1.print(",\"required_score\":");
+  Serial1.print(defaultRequiredHeatingSec);
+  Serial1.print("}");
+
+  Serial1.print(",\"standby\":{");
+  Serial1.print("\"heating\":");
+  Serial1.print(standbyHeatingActive ? "true" : "false");
+  Serial1.print(",\"started_ms\":");
+  Serial1.print(standbyHeatingStartedMs);
+  Serial1.print(",\"elapsed_s\":");
+  Serial1.print(standbyHeatingElapsedSec);
+  Serial1.print(",\"remaining_s\":");
+  Serial1.print(standbyHeatingRemainingSec);
+  Serial1.print(",\"temperature_c\":");
+  Serial1.print(standbyTemperatureTelemetry, 2);
+  Serial1.print(",\"servo_open_time_s\":");
+  Serial1.print(standbyServoOpenTimeSec, 2);
+  Serial1.print(",\"heating_target_s\":");
+  Serial1.print(standbyRequiredHeatingSec);
+  Serial1.print(",\"current_score\":");
+  Serial1.print(standbyHeatingElapsedSec);
+  Serial1.print(",\"required_score\":");
+  Serial1.print(standbyRequiredHeatingSec);
+  Serial1.print("}");
+  
+  // New heating system telemetry
+  Serial1.print(",\"top_ptc_on\":");
+  Serial1.print(digitalRead(TOP_PTC_PIN) == PTC_ACTIVE ? "true" : "false");
+  Serial1.print(",\"bottom_ptc_on\":");
+  Serial1.print(digitalRead(BOTTOM_PTC_PIN) == PTC_ACTIVE ? "true" : "false");
+  Serial1.print(",\"new_fan_on\":");
+  Serial1.print(digitalRead(NEW_FAN_PIN) == FAN_ACTIVE ? "true" : "false");
+  Serial1.print(",\"top_temp\":");
+  Serial1.print(latestTopTemp, 2);
+  Serial1.print(",\"bottom_temp\":");
+  Serial1.print(latestBottomTemp, 2);
+  Serial1.print(",\"current_weight\":");
+  Serial1.print(latestWeight, 1);
+  Serial1.print(",\"start_weight\":");
+  Serial1.print(startWeight, 1);
+  Serial1.print(",\"target_weight\":");
+  Serial1.print(targetWeight, 1);
+  Serial1.print(",\"air_clean_on\":");
+  Serial1.print(airCleanActive ? "true" : "false");
+
+  // Explicit user-requested keys matching requested labels
+  Serial1.print(",\"weight_heating_on\":");
+  Serial1.print(newHeatingState != NEW_HEATING_OFF ? "true" : "false");
+  Serial1.print(",\"weight_heating_start_weight\":");
+  Serial1.print(startWeight, 1);
+  Serial1.print(",\"weight_heating_target_weight\":");
+  Serial1.print(targetWeight, 1);
+  Serial1.print(",\"weight_heating_top_temp\":");
+  Serial1.print(latestTopTemp, 2);
+  Serial1.print(",\"weight_heating_bottom_temp\":");
+  Serial1.print(latestBottomTemp, 2);
+  Serial1.print(",\"air_cleaning_on\":");
+  Serial1.print(airCleanActive ? "true" : "false");
+  Serial1.print(",\"lock_status\":");
+  Serial1.print(doorLocked ? "\"locked\"" : "\"unlocked\"");
+
+  Serial1.println("}");
+}
+
+void telemetryDelay(unsigned long durationMs) {
+  unsigned long start = millis();
+
+  while (millis() - start < durationMs) {
+    enforceHeatingInterlock();
+    sendTelemetry(false);
+    responsiveDelay(25);
+  }
+}
+
+// ==================================================
+// SENSORS
+// ==================================================
+float readHumidity() {
+  responsiveDelay(2000); // DHT22 minimum practical read interval
+  return dht.readHumidity();
+}
+
+float readDefaultTemperature() {
+  defaultTempSensor.requestTemperatures();
+  return defaultTempSensor.getTempCByIndex(0);
+}
+
+float readStandbyTemperature() {
+  standbyTempSensor.requestTemperatures();
+  return standbyTempSensor.getTempCByIndex(0);
+}
+
+bool validTemperature(float temperature) {
+  return temperature != DEVICE_DISCONNECTED_C &&
+         temperature >= -100.0 &&
+         temperature <= 125.0;
+}
+
+// ==================================================
+// SERVO FUNCTIONS
+// ==================================================
+void openDefaultDoorSmoothly() {
+  stopDefaultHeating();
+
+  for (int angle = DEFAULT_DOOR_CLOSED;
+       angle >= DEFAULT_DOOR_OPEN;
+       angle--) {
+    defaultServo.write(angle);
+    responsiveDelay(SERVO_STEP_DELAY_DEFAULT);
+  }
+}
+
+void closeDefaultDoorSmoothly() {
+  for (int angle = DEFAULT_DOOR_OPEN;
+       angle <= DEFAULT_DOOR_CLOSED;
+       angle++) {
+    defaultServo.write(angle);
+    responsiveDelay(SERVO_STEP_DELAY_DEFAULT);
+  }
+}
+
+void openStandbyDoorSmoothly() {
+  stopStandbyHeating();
+
+  for (int angle = STANDBY_DOOR_CLOSED;
+       angle <= STANDBY_DOOR_OPEN;
+       angle++) {
+    standbyServo.write(angle);
+    responsiveDelay(SERVO_STEP_DELAY_STANDBY);
+  }
+}
+
+void closeStandbyDoorSmoothly() {
+  if (!standbyDoorOpen) {
+    standbyServo.write(STANDBY_DOOR_CLOSED);
+    return;
+  }
+
+  for (int angle = STANDBY_DOOR_OPEN;
+       angle >= STANDBY_DOOR_CLOSED;
+       angle--) {
+    standbyServo.write(angle);
+    responsiveDelay(SERVO_STEP_DELAY_STANDBY);
+  }
+}
+
+// ==================================================
+// MOTOR FUNCTIONS
+// ==================================================
+void moveDefaultOut() {
+  digitalWrite(DEFAULT_MOTOR_IN3, LOW);
+  digitalWrite(DEFAULT_MOTOR_IN4, HIGH);
+}
+
+void moveDefaultIn() {
+  digitalWrite(DEFAULT_MOTOR_IN3, HIGH);
+  digitalWrite(DEFAULT_MOTOR_IN4, LOW);
+}
+
+void stopDefaultMotor() {
+  digitalWrite(DEFAULT_MOTOR_IN3, LOW);
+  digitalWrite(DEFAULT_MOTOR_IN4, LOW);
+}
+
+void moveStandbyIn() {
+  digitalWrite(STANDBY_MOTOR_IN3, LOW);
+  digitalWrite(STANDBY_MOTOR_IN4, HIGH);
+}
+
+void moveStandbyOut() {
+  digitalWrite(STANDBY_MOTOR_IN3, HIGH);
+  digitalWrite(STANDBY_MOTOR_IN4, LOW);
+}
+
+void stopStandbyMotor() {
+  digitalWrite(STANDBY_MOTOR_IN3, LOW);
+  digitalWrite(STANDBY_MOTOR_IN4, LOW);
+}
+
+// ==================================================
+// HEATING OUTPUTS - ACTIVE LOW
+// ==================================================
+void startDefaultHeating() {
+  stopStandbyHeating();
+  digitalWrite(DEFAULT_PTC_PIN, LOW);
+  digitalWrite(DEFAULT_FAN_PIN, LOW);
+  defaultHeatingActive = true;
+  enforceHeatingInterlock();
+}
+
+void stopDefaultHeating() {
+  digitalWrite(DEFAULT_PTC_PIN, HIGH);
+  digitalWrite(DEFAULT_FAN_PIN, HIGH);
+  defaultHeatingActive = false;
+}
+
+void startStandbyHeating() {
+  if (defaultHeatingActive ||
+      digitalRead(DEFAULT_PTC_PIN) == LOW ||
+      digitalRead(DEFAULT_LIMIT_IN) != LOW) {
+    stopStandbyHeating();
+    Serial.println("STANDBY heater start blocked");
+    return;
+  }
+
+  digitalWrite(STANDBY_PTC_PIN, LOW);
+  digitalWrite(STANDBY_FAN_PIN, LOW);
+  standbyHeatingActive = true;
+  enforceHeatingInterlock();
+}
+
+void stopStandbyHeating() {
+  digitalWrite(STANDBY_PTC_PIN, HIGH);
+  digitalWrite(STANDBY_FAN_PIN, HIGH);
+  standbyHeatingActive = false;
+}
+
+void enforceHeatingInterlock() {
+  bool defaultOutputOn = digitalRead(DEFAULT_PTC_PIN) == LOW;
+  bool standbyOutputOn = digitalRead(STANDBY_PTC_PIN) == LOW;
+
+  if ((defaultHeatingActive && standbyHeatingActive) ||
+      (defaultOutputOn && standbyOutputOn)) {
+    Serial.println("CRITICAL: Both heaters ON; stopping STANDBY");
+    stopStandbyHeating();
+  }
+}
+
+// ==================================================
+// LIMITS / HOMING
+// ==================================================
+bool waitForLimit(
+    int limitPin,
+    unsigned long timeout,
+    const char* limitName) {
+
+  unsigned long startedAt = millis();
+
+  while (digitalRead(limitPin) != LOW) {
+    serviceAuxiliaryControls();
+    enforceHeatingInterlock();
+    sendTelemetry(false);
+
+    if (millis() - startedAt >= timeout) {
+      Serial.print("TIMEOUT waiting for ");
+      Serial.println(limitName);
+      return false;
+    }
+
+    responsiveDelay(10);
+  }
+
+  Serial.print(limitName);
+  Serial.println(" limit reached");
+  return true;
+}
+
+void homeBothTrays() {
+  stopDefaultHeating();
+  stopStandbyHeating();
+  ensureBothDoorsClosed();
+
+  if (digitalRead(DEFAULT_LIMIT_IN) != LOW) {
+    Serial.println("Homing DEFAULT tray IN");
+    moveDefaultIn();
+    waitForLimit(DEFAULT_LIMIT_IN,
+                 MOTOR_TRAVEL_TIMEOUT,
+                 "DEFAULT IN");
+    stopDefaultMotor();
+  } else {
+    stopDefaultMotor();
+  }
+
+  if (digitalRead(STANDBY_LIMIT_IN) != LOW) {
+    Serial.println("Homing STANDBY tray IN");
+    moveStandbyIn();
+    waitForLimit(STANDBY_LIMIT_IN,
+                 MOTOR_TRAVEL_TIMEOUT,
+                 "STANDBY IN");
+    stopStandbyMotor();
+  } else {
+    stopStandbyMotor();
+  }
+
+  responsiveDelay(LIMIT_SETTLE_TIME);
+}
+
+void returnStandbyToHumidityControl() {
+  stopStandbyHeating();
+  stopStandbyMotor();
+
+  if (digitalRead(STANDBY_LIMIT_IN) != LOW) {
+    moveStandbyIn();
+    waitForLimit(STANDBY_LIMIT_IN,
+                 MOTOR_TRAVEL_TIMEOUT,
+                 "STANDBY IN");
+    stopStandbyMotor();
+  }
+
+  closeStandbyDoorSmoothly();
+  standbyDoorOpen = false;
+}
+
+void ensureBothDoorsClosed() {
+  defaultServo.write(DEFAULT_DOOR_CLOSED);
+  defaultDoorOpen = false;
+
+  if (standbyDoorOpen) {
+    closeStandbyDoorSmoothly();
+  } else {
+    standbyServo.write(STANDBY_DOOR_CLOSED);
+  }
+
+  standbyDoorOpen = false;
+}
+
+// ==================================================
+// AUXILIARY BACKGROUND SERVICE
+// Keeps lock, RFID, buzzer and manual tray responsive
+// even while the silica-gel controller is busy.
+// ==================================================
+void serviceAuxiliaryControls() {
+  if (!auxiliaryControlsReady) {
+    return;
+  }
+
+  lockPeltierButton.tick();
+  servicePeltierTemperatureControl();
+  handleRFID();
+  handleTrayControls();
+  handleLimitSwitches();
+  handleBuzzer();
+  handleTemporaryRFIDUnlock();
+  serviceNewHeatingSystem();
+  updateLCD();
+  serviceAirCleaning();
+}
+
+void responsiveDelay(unsigned long durationMs) {
+  unsigned long startedAt = millis();
+
+  while (millis() - startedAt < durationMs) {
+    serviceAuxiliaryControls();
+    enforceHeatingInterlock();
+    sendTelemetry(false);
+    delay(1);
+  }
+}
+
+// =====================================================
+// PELTIER CONTROL - ACTIVE LOW
+// =====================================================
+void turnPeltierOff() {
+  digitalWrite(PELTIER_PIN, HIGH);
+
+  if (peltierOutputOn) {
+    Serial.println("Peltier OFF");
+  }
+
+  peltierOutputOn = false;
+}
+
+void turnPeltierOn() {
+  // Absolute safety interlock: Peltier is only active when the lock is locked.
+  if (!doorLocked || !peltierControlEnabled) {
+    turnPeltierOff();
+    return;
+  }
+
+  digitalWrite(PELTIER_PIN, LOW);
+
+  if (!peltierOutputOn) {
+    Serial.println("Peltier ON");
+  }
+
+  peltierOutputOn = true;
+}
+
+void servicePeltierTemperatureControl() {
+  // Peltier is only active when the lock is locked.
+  if (!doorLocked || !peltierControlEnabled) {
+    turnPeltierOff();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastPeltierTemperatureCheckMs < PELTIER_TEMP_CHECK_INTERVAL) {
+    return;
+  }
+
+  lastPeltierTemperatureCheckMs = now;
+  float temperature = dht.readTemperature();
+
+  if (isnan(temperature)) {
+    Serial.println("ERROR: DHT22 temperature read failed; Peltier OFF");
+    turnPeltierOff();
+    return;
+  }
+
+  latestMainTemperature = temperature;
+  Serial.print("Main DHT22 temperature: ");
+  Serial.print(temperature, 2);
+  Serial.println(" C");
+
+  // Hysteresis: ON above threshold, OFF one degree below threshold.
+  if (!peltierOutputOn && temperature > PELTIER_TEMP_THRESHOLD) {
+    turnPeltierOn();
+  } else if (peltierOutputOn &&
+             temperature <= PELTIER_TEMP_THRESHOLD - PELTIER_TEMP_HYSTERESIS) {
+    turnPeltierOff();
+  }
+}
+
+// Quick press toggles automatic Peltier permission.
+void handlePeltierQuickPress() {
+  if (peltierControlEnabled) {
+    peltierControlEnabled = false;
+    turnPeltierOff();
+    Serial.println("Peltier control DISABLED. Lock can now be used.");
+    shortBeep();
+    return;
+  }
+
+  // Peltier is only active when the lock is locked.
+  if (!doorLocked) {
+    turnPeltierOff();
+    Serial.println("Lock the system before enabling the Peltier!");
+    soundAlarm();
+    return;
+  }
+
+  peltierControlEnabled = true;
+  lastPeltierTemperatureCheckMs = 0;
+  Serial.println("Peltier automatic temperature control ENABLED");
+  successBeep();
+  servicePeltierTemperatureControl();
+}
+
+// Long press toggles lock/unlock, but only after Peltier control is disabled.
+void handleLockLongPress() {
+  if (peltierControlEnabled || peltierOutputOn ||
+      digitalRead(PELTIER_PIN) == LOW) {
+    turnPeltierOff();
+    Serial.println("Turn OFF Peltier control with a quick press first!");
+    soundAlarm();
+    return;
+  }
+
+  temporaryRFIDUnlock = false;
+
+  if (doorLocked) {
+    unlockDoor();
+  } else {
+    lockDoor();
+  }
+
+  successBeep();
+}
+
+// =====================================================
+// LOCK CONTROL
+// =====================================================
+void lockDoor() {
+  // Global safety: every lock path must first force the Peltier OFF.
+  peltierControlEnabled = false;
+  turnPeltierOff();
+
+  digitalWrite(LOCK_PIN, LOCK_ACTIVE_STATE);
+  doorLocked = true;
+
+  if (trayDirection == TRAY_MOVING_OUT) {
+    stopTray();
+  }
+
+  Serial.println("LOCKED");
+}
+
+void unlockDoor() {
+  digitalWrite(LOCK_PIN, LOCK_INACTIVE_STATE);
+  doorLocked = false;
+  Serial.println("UNLOCKED");
+}
+
+// =====================================================
+// RFID CONTROL
+// =====================================================
+
+void handleRFID() {
+  if (!rfid.PICC_IsNewCardPresent()) {
+    return;
+  }
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  Serial.print("RFID UID: ");
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) {
+      Serial.print("0");
+    }
+
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    Serial.print(" ");
+  }
+
+  Serial.println();
+
+  if (isAuthorizedCard()) {
+    Serial.println("Authorized RFID detected");
+
+    unlockDoor();
+    peltierControlEnabled = false;
+    turnPeltierOff();
+    Serial.println("Peltier remains disabled until a quick button press.");
+
+    temporaryRFIDUnlock = true;
+    rfidUnlockStartTime = millis();
+
+    successBeep();
+  } else {
+    Serial.println("Unauthorized RFID detected");
+
+    soundAlarm();
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+bool isAuthorizedCard() {
+  if (rfid.uid.size != AUTHORIZED_UID_LENGTH) {
+    return false;
+  }
+
+  for (byte i = 0; i < AUTHORIZED_UID_LENGTH; i++) {
+    if (rfid.uid.uidByte[i] != AUTHORIZED_UID[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// =====================================================
+// RFID AUTO-LOCK
+// =====================================================
+
+void handleTemporaryRFIDUnlock() {
+  if (!temporaryRFIDUnlock) {
+    return;
+  }
+
+  if (millis() - rfidUnlockStartTime >= RFID_UNLOCK_DURATION) {
+    temporaryRFIDUnlock = false;
+    lockDoor();
+
+    Serial.println("RFID unlock time finished. System locked.");
+  }
+}
+
+// =====================================================
+// TRAY BUTTON CONTROL
+// =====================================================
+
+void handleTrayControls() {
+  static bool lastButtonState = HIGH;
+  static unsigned long lastPressTime = 0;
+  static bool nextDirectionIn = true; // Default direction when stopped in the middle
+
+  bool currentButtonState = digitalRead(OUT_BUTTON_PIN);
+  unsigned long now = millis();
+
+  bool outLimitPressed = digitalRead(LIMIT_OUT_PIN) == PRESSED;
+  bool inLimitPressed  = digitalRead(LIMIT_IN_PIN) == PRESSED;
+
+  // Check for button press edge detection with debounce guard
+  if (currentButtonState == LOW && lastButtonState == HIGH && (now - lastPressTime > 200)) {
+    lastPressTime = now;
+
+    if (trayDirection != TRAY_STOPPED) {
+      // If moving, press stops the tray
+      // Next press will move in the opposite direction of the current movement
+      nextDirectionIn = (trayDirection == TRAY_MOVING_OUT);
+      stopTray();
+      Serial.println("Tray stopped by manual button press.");
+    } else {
+      // Decide target direction based on current limit switch states or toggle
+      bool targetDirectionIn = nextDirectionIn;
+
+      if (inLimitPressed) {
+        targetDirectionIn = false; // Already inside, must go outside
+      } else if (outLimitPressed) {
+        targetDirectionIn = true;  // Already outside, must go inside
+      }
+
+      if (targetDirectionIn) {
+        if (inLimitPressed) {
+          Serial.println("Tray already at IN limit.");
+          shortBeep();
+        } else {
+          moveTrayIn();
+          nextDirectionIn = false; // Next toggle goes outside
+        }
+      } else {
+        if (doorLocked) {
+          soundAlarm();
+          Serial.println("WARNING: Tray OUT blocked because lock is active.");
+        } else if (outLimitPressed) {
+          Serial.println("Tray already at OUT limit.");
+          shortBeep();
+        } else {
+          moveTrayOut();
+          nextDirectionIn = true; // Next toggle goes inside
+        }
+      }
+    }
+  }
+
+  lastButtonState = currentButtonState;
+}
+
+// =====================================================
+// LIMIT SWITCH CONTROL
+// =====================================================
+
+void handleLimitSwitches() {
+  bool outLimitPressed = digitalRead(LIMIT_OUT_PIN) == PRESSED;
+  bool inLimitPressed  = digitalRead(LIMIT_IN_PIN) == PRESSED;
+
+  if (trayDirection == TRAY_MOVING_OUT && outLimitPressed) {
+    stopTray();
+    Serial.println("OUT limit reached. Tray stopped.");
+    shortBeep();
+  }
+
+  if (trayDirection == TRAY_MOVING_IN && inLimitPressed) {
+    stopTray();
+    Serial.println("IN limit reached. Tray stopped.");
+    shortBeep();
+  }
+}
+
+// =====================================================
+// MOTOR CONTROL
+// =====================================================
+
+void moveTrayOut() {
+  digitalWrite(MOTOR_IN1_PIN, HIGH);
+  digitalWrite(MOTOR_IN2_PIN, LOW);
+
+  if (trayDirection != TRAY_MOVING_OUT) {
+    trayDirection = TRAY_MOVING_OUT;
+    Serial.println("Tray moving OUT");
+  }
+}
+
+void moveTrayIn() {
+  digitalWrite(MOTOR_IN1_PIN, LOW);
+  digitalWrite(MOTOR_IN2_PIN, HIGH);
+
+  if (trayDirection != TRAY_MOVING_IN) {
+    trayDirection = TRAY_MOVING_IN;
+    Serial.println("Tray moving IN");
+  }
+}
+
+void stopTray() {
+  digitalWrite(MOTOR_IN1_PIN, LOW);
+  digitalWrite(MOTOR_IN2_PIN, LOW);
+
+  trayDirection = TRAY_STOPPED;
+}
+
+// =====================================================
+// BUZZER CONTROL
+// =====================================================
+
+void soundAlarm() {
+  // Avoid repeatedly restarting the alarm every loop.
+  if (!buzzerActive) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(ALARM_LED1_PIN, HIGH);
+    digitalWrite(ALARM_LED2_PIN, HIGH);
+    buzzerStartTime = millis();
+    buzzerActive = true;
+  }
+}
+
+void handleBuzzer() {
+  if (buzzerActive &&
+      millis() - buzzerStartTime >= ALARM_DURATION) {
+
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(ALARM_LED1_PIN, LOW);
+    digitalWrite(ALARM_LED2_PIN, LOW);
+    buzzerActive = false;
+  }
+}
+
+void shortBeep() {
+  tone(BUZZER_PIN, 1500, 150);
+}
+
+void successBeep() {
+  tone(BUZZER_PIN, 2200, 300);
+}
+
+// =====================================================
+// NEW HEATING SYSTEM
+// =====================================================
+
+void serviceWeightSensor() {
+  unsigned long now = millis();
+  if (now - lastWeightReadMs >= 500UL) {
+    if (scale.is_ready()) {
+      float w = scale.get_units(1);
+      latestWeight = w;
+    }
+    lastWeightReadMs = now;
+  }
+}
+
+void serviceNewTempSensors() {
+  unsigned long now = millis();
+  if (!tempRequestPending) {
+    if (now - lastTempRequestMs >= 2000UL) {
+      topTempSensor.requestTemperatures();
+      bottomTempSensor.requestTemperatures();
+      lastTempRequestMs = now;
+      tempRequestPending = true;
+    }
+  } else {
+    if (now - lastTempRequestMs >= 750UL) {
+      float t = topTempSensor.getTempCByIndex(0);
+      if (validTemperature(t)) {
+        latestTopTemp = t;
+      }
+      float b = bottomTempSensor.getTempCByIndex(0);
+      if (validTemperature(b)) {
+        latestBottomTemp = b;
+      }
+      tempRequestPending = false;
+    }
+  }
+}
+
+void handleNewHeatingButton() {
+  static bool lastButtonState = HIGH;
+  static unsigned long lastPressTime = 0;
+  bool currentButtonState = digitalRead(NEW_HEATING_BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (currentButtonState == LOW && lastButtonState == HIGH && (now - lastPressTime > 200)) {
+    lastPressTime = now;
+
+    if (newHeatingState == NEW_HEATING_OFF) {
+      // Get starting weight using average of 5 readings for precision
+      if (scale.is_ready()) {
+        startWeight = scale.get_units(5);
+      } else {
+        startWeight = latestWeight;
+      }
+      targetWeight = startWeight * HEATING_WEIGHT_PERCENTAGE;
+
+      newHeatingState = NEW_HEATING_TOP;
+      digitalWrite(TOP_PTC_PIN, PTC_ACTIVE);
+      digitalWrite(BOTTOM_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(NEW_FAN_PIN, FAN_ACTIVE);
+      Serial.print("New Heating: TOP started. Start weight: ");
+      Serial.print(startWeight);
+      Serial.print("g, Target weight: ");
+      Serial.print(targetWeight);
+      Serial.println("g");
+      
+      // Stop air cleaning if it was running
+      if (airCleanActive) {
+        stopAirCleaning();
+      }
+    } else {
+      newHeatingState = NEW_HEATING_OFF;
+      digitalWrite(TOP_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(BOTTOM_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(NEW_FAN_PIN, FAN_INACTIVE);
+      Serial.println("New Heating: STOPPED manually");
+      startAirCleaning(); // Start 30sec air cleaning
+    }
+    sendTelemetry(true);
+  }
+  lastButtonState = currentButtonState;
+}
+
+void serviceNewHeatingSystem() {
+  handleNewHeatingButton();
+  serviceWeightSensor();
+  serviceNewTempSensors();
+
+  if (newHeatingState != NEW_HEATING_OFF) {
+    // If target weight is reached, stop the entire heating system
+    if (latestWeight <= targetWeight) {
+      newHeatingState = NEW_HEATING_OFF;
+      digitalWrite(TOP_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(BOTTOM_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(NEW_FAN_PIN, FAN_INACTIVE);
+      Serial.print("New Heating: COMPLETED by weight target reached (");
+      Serial.print(latestWeight);
+      Serial.println("g).");
+      sendTelemetry(true);
+      startAirCleaning(); // Start 30sec air cleaning
+      return;
+    }
+  }
+
+  if (newHeatingState == NEW_HEATING_TOP) {
+    if (latestTopTemp > 90.0) {
+      digitalWrite(TOP_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(BOTTOM_PTC_PIN, PTC_ACTIVE);
+      newHeatingState = NEW_HEATING_BOTTOM;
+      Serial.println("New Heating: TOP reached 90C. Switched to BOTTOM.");
+      sendTelemetry(true);
+    }
+  } else if (newHeatingState == NEW_HEATING_BOTTOM) {
+    if (latestBottomTemp > 90.0) {
+      digitalWrite(BOTTOM_PTC_PIN, PTC_INACTIVE);
+      digitalWrite(NEW_FAN_PIN, FAN_INACTIVE);
+      newHeatingState = NEW_HEATING_OFF;
+      Serial.println("New Heating: BOTTOM reached 90C safety limit. Stopped.");
+      sendTelemetry(true);
+      startAirCleaning(); // Start 30sec air cleaning
+    }
+  }
+}
+
+// =====================================================
+// LCD DISPLAY FUNCTIONS
+// =====================================================
+
+void updateLCD() {
+  static float lastLcdHum = -999.0;
+  static float lastLcdTemp = -999.0;
+
+  // Only update LCD when temp or humidity changes to avoid flicker
+  if (latestHumidity != lastLcdHum || latestMainTemperature != lastLcdTemp) {
+    lastLcdHum = latestHumidity;
+    lastLcdTemp = latestMainTemperature;
+
+    lcd.setCursor(0, 0);
+    lcd.print("Temp: ");
+    if (isnan(latestMainTemperature)) {
+      lcd.print("Error   ");
+    } else {
+      lcd.print(latestMainTemperature, 1);
+      lcd.print((char)223); // Degree symbol
+      lcd.print("C   ");
+    }
+
+    lcd.setCursor(0, 1);
+    lcd.print("Hum:  ");
+    if (isnan(latestHumidity)) {
+      lcd.print("Error   ");
+    } else {
+      lcd.print(latestHumidity, 1);
+      lcd.print("%   ");
+    }
+  }
+}
+
+// =====================================================
+// AIR CLEANING FUNCTIONS
+// =====================================================
+
+void startAirCleaning() {
+  digitalWrite(AIR_CLEAN_FAN_PIN, AIR_CLEAN_FAN_ACTIVE);
+  airCleanStartMs = millis();
+  airCleanActive = true;
+  Serial.println("Air Cleaning: STARTED");
+}
+
+void stopAirCleaning() {
+  digitalWrite(AIR_CLEAN_FAN_PIN, AIR_CLEAN_FAN_INACTIVE);
+  airCleanActive = false;
+  Serial.println("Air Cleaning: STOPPED");
+}
+
+void serviceAirCleaning() {
+  if (airCleanActive) {
+    if (millis() - airCleanStartMs >= AIR_CLEAN_TIME) {
+      stopAirCleaning();
+    }
+  }
+}
